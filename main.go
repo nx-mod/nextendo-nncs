@@ -9,6 +9,14 @@
 // The Switch only ever sends test ids 101/102/103; the classifier compares the external port it
 // learns across tests. Ports 33334/33335 are reachability sinkholes (bind, never reply).
 //
+// nncs1-lp1 and nncs2-lp1 resolve to two DIFFERENT server IPs in real Nintendo infra (citron's
+// own redirect table splits them the same way: nncs1 -> nextendo_server_ip, nncs2 ->
+// nextendo_nat_ip). Each responder is bound to an EXPLICIT local IP (never the 0.0.0.0 wildcard)
+// so replies always go out with a source address matching the IP the probe actually arrived on.
+// This matters because the Switch's Pia client uses a connected UDP socket per probe: if a reply
+// comes back from the "wrong" local IP (which is what the kernel's route-selected wildcard
+// source would do on a multi-homed host), the OS silently drops it before the game ever sees it.
+//
 // Protocol verified against MK8 main_v305 disassembly (send 0x962424, parse 0x962500, ports
 // 0x2729/0x278d). Run with the container on --network host so the
 // observed source IP/port are the client's real external endpoint (not a NAT/docker gateway).
@@ -104,13 +112,14 @@ func ipToU32(ip net.IP) uint32 {
 	return 0
 }
 
-// serveNCS answers NAT-check probes on the given UDP port.
-func serveNCS(port int, serverIP uint32) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+// serveNCS answers NAT-check probes on the given UDP port, bound to a specific local IP so
+// replies always carry that same IP as their source address (see package comment).
+func serveNCS(bindIP net.IP, port int, serverIP uint32) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: bindIP, Port: port})
 	if err != nil {
-		log.Fatalf("[nncs] bind :%d failed: %v", port, err)
+		log.Fatalf("[nncs] bind %s:%d failed: %v", bindIP, port, err)
 	}
-	log.Printf("[nncs] NAT-check responder listening on UDP :%d (serverIP=%d)", port, serverIP)
+	log.Printf("[nncs] NAT-check responder listening on %s:%d (serverIP=%d)", bindIP, port, serverIP)
 	buf := make([]byte, 128)
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
@@ -118,7 +127,7 @@ func serveNCS(port int, serverIP uint32) {
 			continue
 		}
 		if n < 16 {
-			log.Printf("[nncs] :%d short %d-byte datagram from %s (ignored)", port, n, src)
+			log.Printf("[nncs] %s:%d short %d-byte datagram from %s (ignored)", bindIP, port, n, src)
 			continue
 		}
 		word0 := binary.BigEndian.Uint32(buf[0:4]) // type/test_id -> echoed unchanged
@@ -129,16 +138,18 @@ func serveNCS(port int, serverIP uint32) {
 		binary.BigEndian.PutUint32(resp[8:12], srcIP)           // observed external IP
 		binary.BigEndian.PutUint32(resp[12:16], serverIP)       // server IP
 		if _, err := conn.WriteToUDP(resp, src); err != nil {
-			log.Printf("[nncs] :%d reply to %s failed: %v", port, src, err)
+			log.Printf("[nncs] %s:%d reply to %s failed: %v", bindIP, port, src, err)
 			continue
 		}
-		log.Printf("[nncs] :%d test=%d <- %s:%d  replied ext=%s:%d", port, word0, src.IP, src.Port, src.IP, src.Port)
+		log.Printf("[nncs] %s:%d test=%d <- %s:%d  replied ext=%s:%d", bindIP, port, word0, src.IP, src.Port, src.IP, src.Port)
 		recordNAT(src.IP.String(), src.Port)        // bridge the external UDP endpoint to the NEX server
 		classifyNAT(src.IP.String(), port, src.Port) // cone vs symmetric (relay trigger)
 	}
 }
 
-// sinkhole binds a port and drains datagrams without replying (the client only needs it reachable).
+// sinkhole binds a port and drains datagrams without replying (the client only needs it
+// reachable, and never gets a reply to validate a source address against, so the wildcard is
+// fine here).
 func sinkhole(port int) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 	if err != nil {
@@ -159,12 +170,22 @@ func main() {
 	if serverIPStr == "" {
 		serverIPStr = "127.0.0.1"
 	}
-	serverIP := ipToU32(net.ParseIP(serverIPStr))
+	ip1 := net.ParseIP(serverIPStr)
 
-	go serveNCS(10025, serverIP)
-	go serveNCS(10125, serverIP)
+	go serveNCS(ip1, 10025, ipToU32(ip1))
+	go serveNCS(ip1, 10125, ipToU32(ip1))
+	log.Printf("[nncs] mk8-nncs-local started, nncs1=%s", serverIPStr)
+
+	if ip2Str := os.Getenv("NNCS_SERVER_IP2"); ip2Str != "" {
+		ip2 := net.ParseIP(ip2Str)
+		go serveNCS(ip2, 10025, ipToU32(ip2))
+		go serveNCS(ip2, 10125, ipToU32(ip2))
+		log.Printf("[nncs] nncs2=%s", ip2Str)
+	} else {
+		log.Printf("[nncs] NNCS_SERVER_IP2 not set — nncs2 identity not bound")
+	}
+
 	go sinkhole(33334)
 	go sinkhole(33335)
-	log.Printf("[nncs] mk8-nncs-local started (serverIP=%s)", serverIPStr)
 	select {}
 }
