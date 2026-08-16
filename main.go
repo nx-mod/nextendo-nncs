@@ -2,12 +2,15 @@
 //
 // The MK8 client (Pia NatDetectionJob) resolves nncs1-lp1.n.n.srv.nintendo.net and
 // nncs2-lp1.n.n.srv.nintendo.net (redirected to this VPS by the console's custom DNS) and sends
-// 16-byte UDP probes to ports 10025 and 10125. Each probe is 4x u32 BIG-ENDIAN:
+// 16-byte UDP probes to port 10025 on BOTH server identities (confirmed via live capture — port
+// 10125 is never actually contacted by a real client, despite this responder also listening
+// there). Each probe is 4x u32 BIG-ENDIAN:
 //   [0]=type/test_id  [4]=ext_port(ignored)  [8]=ext_ip(ignored)  [12]=local_ip
 // We must reply with 16 bytes, 4x u32 BIG-ENDIAN:
 //   [0]=echo type unchanged  [4]=observed UDP source port  [8]=observed source IP  [12]=server IP
 // The Switch only ever sends test ids 101/102/103; the classifier compares the external port it
-// learns across tests. Ports 33334/33335 are reachability sinkholes (bind, never reply).
+// learns across the two server IPs (nncs1 vs nncs2), not across ports. Ports 33334/33335 are
+// reachability sinkholes (bind, never reply).
 //
 // nncs1-lp1 and nncs2-lp1 resolve to two DIFFERENT server IPs in real Nintendo infra (citron's
 // own redirect table splits them the same way: nncs1 -> nextendo_server_ip, nncs2 ->
@@ -30,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // natMap remembers each client's observed external UDP endpoint (public IP -> UDP
@@ -47,11 +51,16 @@ var (
 		return "/data/nat_endpoints.txt"
 	}()
 
-	// natSeen[ip][dstPort] = observed external source port. A symmetric (port-dependent
-	// mapping) NAT hands out a DIFFERENT external port per destination, so if the same IP
-	// shows different source ports across our two probe ports (10025 vs 10125) it is
-	// symmetric — the case the direct natbridge cannot hole-punch, i.e. the relay trigger.
-	natSeen  = map[string]map[int]int{}
+	// natSeen[ip] = the current probing round for that client: readings observed per server
+	// identity (nncs1 vs nncs2, not per destination port — a live capture showed the real
+	// client sends every probe to port 10025 on both). A round resets after roundGap of
+	// silence: the client opens a fresh local UDP socket per round (initial connect, later
+	// P2P hole-punch attempt, ...), and a cone NAT legitimately maps a different local port
+	// to a different external port across separate rounds — comparing a stale reading from
+	// an old round against a fresh one from a new round misreads ordinary cone behavior as
+	// symmetric. Only readings within the same round are ever compared.
+	natSeen = map[string]*natRound{}
+	natType = map[string]string{} // ip -> "cone"|"sym", latest complete round only
 	typeFile = func() string {
 		if v := os.Getenv("NNCS_TYPE_FILE"); v != "" {
 			return v
@@ -59,6 +68,15 @@ var (
 		return "/data/nat_types.txt"
 	}()
 )
+
+// roundGap: a gap longer than this since the last probe from an IP starts a new round.
+// Real rounds observed in capture arrive within well under a second of each other.
+const roundGap = 3 * time.Second
+
+type natRound struct {
+	started  time.Time
+	readings map[string]int // serverIdentity -> external port, this round only
+}
 
 func recordNAT(ip string, port int) {
 	natMu.Lock()
@@ -71,36 +89,45 @@ func recordNAT(ip string, port int) {
 	_ = os.WriteFile(natFile, []byte(b.String()), 0644)
 }
 
-// classifyNAT records the (dstPort -> external srcPort) mapping for an IP and, once it
-// has seen the client on both probe ports, writes cone|sym to /data/nat_types.txt so the
-// secure server's shouldRelay() can decide whether the P2P link needs the relay.
-func classifyNAT(ip string, dstPort, srcPort int) {
+// classifyNAT records (serverIdentity -> external srcPort) for the client's current
+// probing round and, once that round has been observed via 2+ server identities, writes
+// this round's cone|sym verdict for the IP to /data/nat_types.txt so the secure server's
+// shouldRelay() can decide whether the P2P link needs the relay. See natSeen/natRound for
+// why a round is only ever compared against itself, never a different round.
+func classifyNAT(ip string, serverIdentity string, srcPort int) {
 	natMu.Lock()
 	defer natMu.Unlock()
-	m := natSeen[ip]
-	if m == nil {
-		m = map[int]int{}
-		natSeen[ip] = m
+
+	now := time.Now()
+	round := natSeen[ip]
+	if round == nil || now.Sub(round.started) > roundGap {
+		round = &natRound{started: now, readings: map[string]int{}}
+		natSeen[ip] = round
 	}
-	m[dstPort] = srcPort
+	round.readings[serverIdentity] = srcPort
+
+	if len(round.readings) < 2 {
+		return
+	}
+	sym := false
+	var first int
+	got := false
+	for _, sp := range round.readings {
+		if !got {
+			first, got = sp, true
+		} else if sp != first {
+			sym = true
+		}
+	}
+	kind := "cone"
+	if sym {
+		kind = "sym"
+	}
+	natType[ip] = kind
 
 	var b strings.Builder
-	for cip, ports := range natSeen {
-		sym := false
-		var first int
-		got := false
-		for _, sp := range ports {
-			if !got {
-				first, got = sp, true
-			} else if sp != first {
-				sym = true
-			}
-		}
-		kind := "cone"
-		if sym {
-			kind = "sym"
-		}
-		b.WriteString(cip + " " + kind + "\n")
+	for cip, k := range natType {
+		b.WriteString(cip + " " + k + "\n")
 	}
 	_ = os.WriteFile(typeFile, []byte(b.String()), 0644)
 }
@@ -142,8 +169,8 @@ func serveNCS(bindIP net.IP, port int, serverIP uint32) {
 			continue
 		}
 		log.Printf("[nncs] %s:%d test=%d <- %s:%d  replied ext=%s:%d", bindIP, port, word0, src.IP, src.Port, src.IP, src.Port)
-		recordNAT(src.IP.String(), src.Port)        // bridge the external UDP endpoint to the NEX server
-		classifyNAT(src.IP.String(), port, src.Port) // cone vs symmetric (relay trigger)
+		recordNAT(src.IP.String(), src.Port)                    // bridge the external UDP endpoint to the NEX server
+		classifyNAT(src.IP.String(), bindIP.String(), src.Port)   // cone vs symmetric (relay trigger)
 	}
 }
 
