@@ -73,6 +73,10 @@ var (
 // Real rounds observed in capture arrive within well under a second of each other.
 const roundGap = 3 * time.Second
 
+// diagnosticTestID marks an emulator's own network-check probe, sent from a socket the
+// game never uses. Answered like any other, but never recorded — see serveNCS.
+const diagnosticTestID = 201
+
 type natRound struct {
 	started  time.Time
 	readings map[string]int // serverIdentity -> external port, this round only
@@ -141,11 +145,15 @@ func ipToU32(ip net.IP) uint32 {
 
 // serveNCS answers NAT-check probes on the given UDP port, bound to a specific local IP so
 // replies always carry that same IP as their source address (see package comment).
-func serveNCS(bindIP net.IP, port int, serverIP uint32) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: bindIP, Port: port})
-	if err != nil {
-		log.Fatalf("[nncs] bind %s:%d failed: %v", bindIP, port, err)
-	}
+//
+// Test 102 (kinnay wiki, NAT-Check-Server#message-types) must be answered from the SAME ip
+// but a DIFFERENT port than the one the probe arrived on -- that's how the client determines
+// its NAT filtering mode. This responder previously always replied from the exact socket that
+// received the probe, for every test id, so 102 could never be answered the way the client
+// needs: the reply carries the wrong (same) source port, and the client's NAT filtering check
+// never gets satisfied. peerConn is the sibling responder on the OTHER of the two ports (10025
+// <-> 10125) for the same identity, used only for that one test id.
+func serveNCS(bindIP net.IP, port int, serverIP uint32, conn *net.UDPConn, peerConn *net.UDPConn) {
 	log.Printf("[nncs] NAT-check responder listening on %s:%d (serverIP=%d)", bindIP, port, serverIP)
 	buf := make([]byte, 128)
 	for {
@@ -164,11 +172,26 @@ func serveNCS(bindIP net.IP, port int, serverIP uint32) {
 		binary.BigEndian.PutUint32(resp[4:8], uint32(src.Port)) // observed external port
 		binary.BigEndian.PutUint32(resp[8:12], srcIP)           // observed external IP
 		binary.BigEndian.PutUint32(resp[12:16], serverIP)       // server IP
-		if _, err := conn.WriteToUDP(resp, src); err != nil {
-			log.Printf("[nncs] %s:%d reply to %s failed: %v", bindIP, port, src, err)
+
+		replyConn := conn
+		replyPort := port
+		if word0 == 102 && peerConn != nil {
+			replyConn = peerConn
+			replyPort = 10025 + 10125 - port // the sibling port
+		}
+		if _, err := replyConn.WriteToUDP(resp, src); err != nil {
+			log.Printf("[nncs] %s:%d reply to %s failed: %v", bindIP, replyPort, src, err)
 			continue
 		}
-		log.Printf("[nncs] %s:%d test=%d <- %s:%d  replied ext=%s:%d", bindIP, port, word0, src.IP, src.Port, src.IP, src.Port)
+		log.Printf("[nncs] %s:%d test=%d <- %s:%d  replied from port %d ext=%s:%d", bindIP, port, word0, src.IP, src.Port, replyPort, src.IP, src.Port)
+		if word0 == diagnosticTestID {
+			// An emulator's own network-check UI, probing from a throwaway socket that the
+			// game never plays on. Answer it (the check needs the reading) but never record
+			// its port: the file feeds the NEX servers' P2P bridge, and a diagnostic port
+			// overwrites the game's real one for that IP, so peers get an address nothing
+			// listens on. The Switch only ever sends 101/102/103.
+			continue
+		}
 		recordNAT(src.IP.String(), src.Port)                    // bridge the external UDP endpoint to the NEX server
 		classifyNAT(src.IP.String(), bindIP.String(), src.Port)   // cone vs symmetric (relay trigger)
 	}
@@ -192,21 +215,37 @@ func sinkhole(port int) {
 	}
 }
 
+// bindIdentity opens both the primary (10025) and secondary (10125) ports for one server
+// identity up front, so each can hand the other to serveNCS as its sibling for test 102.
+func bindIdentity(ip net.IP) (primary, secondary *net.UDPConn) {
+	var err error
+	primary, err = net.ListenUDP("udp4", &net.UDPAddr{IP: ip, Port: 10025})
+	if err != nil {
+		log.Fatalf("[nncs] bind %s:10025 failed: %v", ip, err)
+	}
+	secondary, err = net.ListenUDP("udp4", &net.UDPAddr{IP: ip, Port: 10125})
+	if err != nil {
+		log.Fatalf("[nncs] bind %s:10125 failed: %v", ip, err)
+	}
+	return primary, secondary
+}
+
 func main() {
 	serverIPStr := os.Getenv("NNCS_SERVER_IP")
 	if serverIPStr == "" {
 		serverIPStr = "127.0.0.1"
 	}
 	ip1 := net.ParseIP(serverIPStr)
-
-	go serveNCS(ip1, 10025, ipToU32(ip1))
-	go serveNCS(ip1, 10125, ipToU32(ip1))
+	ip1Primary, ip1Secondary := bindIdentity(ip1)
+	go serveNCS(ip1, 10025, ipToU32(ip1), ip1Primary, ip1Secondary)
+	go serveNCS(ip1, 10125, ipToU32(ip1), ip1Secondary, ip1Primary)
 	log.Printf("[nncs] mk8-nncs-local started, nncs1=%s", serverIPStr)
 
 	if ip2Str := os.Getenv("NNCS_SERVER_IP2"); ip2Str != "" {
 		ip2 := net.ParseIP(ip2Str)
-		go serveNCS(ip2, 10025, ipToU32(ip2))
-		go serveNCS(ip2, 10125, ipToU32(ip2))
+		ip2Primary, ip2Secondary := bindIdentity(ip2)
+		go serveNCS(ip2, 10025, ipToU32(ip2), ip2Primary, ip2Secondary)
+		go serveNCS(ip2, 10125, ipToU32(ip2), ip2Secondary, ip2Primary)
 		log.Printf("[nncs] nncs2=%s", ip2Str)
 	} else {
 		log.Printf("[nncs] NNCS_SERVER_IP2 not set — nncs2 identity not bound")
